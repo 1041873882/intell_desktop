@@ -1,0 +1,254 @@
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <setjmp.h>
+
+#include <jpeg/jpeglib.h>
+#include <png/png.h>
+
+#include "mFB.h"
+#include "mPixmap.h"
+#include "mWindow.h"
+
+struct my_error_mgr {
+	struct jpeg_error_mgr pub;	/* "public" fields */
+	jmp_buf setjmp_buffer;	/* for return to caller */
+};
+
+typedef struct my_error_mgr * my_error_ptr;
+
+/*
+ * Here's the routine that will replace the standard error_exit method:
+ */
+
+void my_error_exit(j_common_ptr cinfo)
+{
+	/* cinfo->err really points to a my_error_mgr struct, so coerce pointer */
+	my_error_ptr myerr = (my_error_ptr) cinfo->err;
+
+	/* Always display the message. */
+	/* We could postpone this until after returning, if we chose. */
+	(*cinfo->err->output_message) (cinfo);
+
+	/* Return control to the setjmp point */
+	longjmp(myerr->setjmp_buffer, 1);
+}
+
+mPixmap::mPixmap()
+{
+	m_argb = NULL;
+	m_alpha = 0xFF;
+	m_jpeg = 0;
+}
+
+mPixmap::~mPixmap()
+{
+	this->recycle();
+}
+
+void mPixmap::recycle(void)
+{
+	if (m_argb) {
+		delete []m_argb;
+		m_argb = NULL;
+	}
+	m_width = 0;
+	m_height = 0;
+}
+
+int mPixmap::loadFile(const char *url)
+{
+	this->recycle();
+	m_jpeg = 0;
+
+	if (url == NULL || strlen(url) < 5)
+		return -1;
+
+	const char *ft = url+strlen(url)-4;
+	if (!strcasecmp(ft, ".png"))
+		return png(url);
+	else if (!strcasecmp(ft, ".jpg"))
+		return jpeg(url);
+	return -1;
+}
+
+int mPixmap::png(const char *url)
+{
+	FILE *fp = fopen(url, "rb");
+	if (fp == NULL)
+		return -1;
+
+	png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, 0, 0, 0);
+	png_infop info_ptr = png_create_info_struct(png_ptr);
+	setjmp(png_jmpbuf(png_ptr));
+
+	png_init_io(png_ptr, fp);
+
+	png_read_png(png_ptr, info_ptr, PNG_TRANSFORM_EXPAND, 0);
+
+	m_width = png_get_image_width(png_ptr, info_ptr);
+	m_height = png_get_image_height(png_ptr, info_ptr);
+
+	int type = png_get_color_type(png_ptr, info_ptr);
+
+	m_argb = new uint32_t[m_height*m_width];
+	memset(m_argb, 0xFF, sizeof(uint32_t)*m_height*m_width);
+
+	int block = (type == 6 ? 4 : 3); //type == 6 有Alpha，其他无
+	int n = 0;
+
+	png_bytep *row_pointers = png_get_rows(png_ptr, info_ptr);
+	for(int i = 0; i < m_height; i++) {
+		for(int j = 0; j < (block*m_width); j += block) {
+			memcpy(&m_argb[n], &row_pointers[i][j], block);
+			n++;
+		}
+	}
+	png_destroy_read_struct(&png_ptr, &info_ptr, 0);
+	fclose(fp);
+
+	//转换成ARGB格式
+	n = m_width*m_height;
+	for(int i=0; i<n; i++) {
+		uint8_t *p = (uint8_t *)&m_argb[i];
+		m_argb[i] = ((p[3]<<24) | p[0]<<16 | p[1]<<8 | p[2]);
+	}
+
+	return 0;
+}
+
+int mPixmap::jpeg(const char *url)
+{
+	FILE *fp = fopen(url, "rb");
+	if (fp == NULL)
+		return -1;
+
+	struct jpeg_decompress_struct cinfo;
+	struct my_error_mgr jerr;
+
+	cinfo.err = jpeg_std_error(&jerr.pub);
+	jerr.pub.error_exit = my_error_exit;
+	 /* Establish the setjmp return context for my_error_exit to use. */
+	if (setjmp(jerr.setjmp_buffer)) {
+		fclose(fp);
+		return -1;
+	}
+
+	jpeg_create_decompress(&cinfo);
+	jpeg_stdio_src(&cinfo, fp);
+	jpeg_read_header(&cinfo, TRUE);
+	jpeg_start_decompress(&cinfo);
+
+	m_width = cinfo.output_width;
+	m_height = cinfo.output_height;
+
+	m_argb = new uint32_t[m_height*m_width];
+	memset(m_argb, 0xFF, sizeof(uint32_t)*m_height*m_width);
+
+	int sz = cinfo.output_width * cinfo.output_components;
+	JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr) &cinfo, JPOOL_IMAGE, sz, 1);
+
+	while (cinfo.output_scanline < cinfo.output_height) {
+		jpeg_read_scanlines(&cinfo, buffer, 1);
+
+		uint32_t *p = m_argb+m_width*(cinfo.output_scanline-1);
+		uint8_t *d = buffer[0];
+		int n = 0;
+		for(int i=0; i<m_width; i++) {
+			p[i] = (0xFF<<24) | (d[n]<<16) | (d[n+1]<<8) | d[n+2];
+			n += 3;
+		}
+	}
+
+	jpeg_finish_decompress(&cinfo);
+	jpeg_destroy_decompress(&cinfo);
+	fclose(fp);
+
+	m_jpeg = 1;
+
+	return 0;
+}
+
+void mPixmap::load(dxml &p, const char *zone)
+{
+	const char *root = p.getText("/style/root");
+	if (root) {
+		char s[512], s2[512];
+		sprintf(s, "/style/%s/url", zone);
+		sprintf(s2, "%s/%s", root, p.getText(s));
+		this->loadFile(s2);
+		mObject::load(p, zone);
+	}
+}
+
+void mPixmap::doPaint(void)
+{
+	if (m_visible && m_argb && fb.m_argb) {
+		if (m_jpeg && (m_x+m_width <= fb.m_width) && (m_y+m_height) <= fb.m_height) {
+			int fb_offset = m_y*fb.m_width+m_x;
+			int offset = 0;
+			for(int y=0; y<m_height; y++) {
+				memcpy(&fb.m_argb[fb_offset], &m_argb[offset], m_width<<2);
+				offset += m_width;
+				fb_offset += fb.m_width;
+			}
+		} else {
+			if (m_alpha != 0xFF) {
+				uint32_t c;
+				uint8_t *p = (uint8_t *)&c;
+				for(int y=0; y<m_height; y++) {
+					for(int x=0; x<m_width; x++) {
+						c = m_argb[y*m_width+x];
+						p[3] = (p[3]*m_alpha)>>8;
+						fb.pixel(m_x+x, m_y+y, c);
+					}
+				}
+			} else {
+				for(int y=0; y<m_height; y++) {
+					for(int x=0; x<m_width; x++) {
+						fb.pixel(m_x+x, m_y+y, m_argb[y*m_width+x]);
+					}
+				}
+			}
+		}
+	}
+	mObject::doPaint();
+}
+
+uint32_t mPixmap::pixel(int x, int y)
+{
+	if (m_argb) {
+		if (m_alpha != 0xFF) {
+			uint32_t argb = m_argb[y*m_width+x];
+			uint8_t *p = (uint8_t *)&argb;
+			p[3] = (p[3]*m_alpha)>>8;
+			return argb;
+		}
+		return m_argb[y*m_width+x];
+	}
+	return 0;
+}
+
+#include "SysUtils.h"
+int mPixmap::resize(int w, int h)
+{
+	int result = -1;
+	if (m_argb) {
+		uint32_t *dst = new uint32_t[w*h];
+		if (dst) {
+			int r = sws_scale_argb(m_argb, m_width, m_height, dst, w, h);
+			if (r > 0) {
+				this->recycle();
+				m_argb = dst;
+				m_width = w;
+				m_height = h;
+				this->paint();
+				result = 0;
+			} else {
+				delete []dst;
+			}
+		}
+	}
+	return result;
+}
